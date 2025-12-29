@@ -66,7 +66,7 @@
     <button class="btn" id="btnDay">Ngày</button>
     <button class="btn" id="btnHour">Giờ</button>
     <button class="btn" id="btnMinute">Phút</button>
-    <button class="btn" id="btnNow">Hiện tại</button>
+    <button class="btn" id="btnNow">Hiện tại (60s)</button>
     <div class="hint" id="hint"></div>
   </div>
 
@@ -106,9 +106,6 @@
 
   const ROOT = "DataGarden/Sensor";
   const LIMIT_POINTS = 60; // ✅ 60 khung gần nhất
-
-  // “Hiện tại” sẽ dùng theo GIÂY
-  const CURRENT_MODE = "second"; // ✅ 60 giây gần nhất
 
   const noDataEl = document.getElementById("noData");
   const canvasEl = document.getElementById("chart");
@@ -164,7 +161,7 @@
     return `${weekYear}-W${pad2(week)}`;                            // YYYY-Wxx
   }
 
-  // Label theo mode (rút năm 2025->25)
+  // Label theo mode
   function labelForMode(mode, dt){
     const y2 = String(dt.getFullYear()).slice(-2);
     const m  = pad2(dt.getMonth()+1);
@@ -173,7 +170,7 @@
     const mi = pad2(dt.getMinutes());
     const s  = pad2(dt.getSeconds());
 
-    if (mode === "second") return `${h}:${mi}:${s}`;           // ✅ hh:mm:ss (realtime)
+    if (mode === "second") return `${h}:${mi}:${s}`;           // hh:mm:ss
     if (mode === "minute") return `${d}/${m} ${h}:${mi}`;
     if (mode === "hour")   return `${d}/${m} ${h}h`;
     if (mode === "day")    return `${d}/${m}`;
@@ -217,7 +214,7 @@
   }
 
   // tạo window 60 giây gần nhất
-  function buildCurrentSecondWindow(now = new Date()){
+  function buildSecondWindow(now = new Date()){
     const buckets = [];
     const end = new Date(now);
     end.setMilliseconds(0);
@@ -243,7 +240,8 @@
         label: SENSOR_ID,
         data: [],
         tension: 0.25,
-        pointRadius: 2
+        pointRadius: 2,
+        spanGaps: true // ✅ nối qua chỗ null (thêm đẹp)
       }]
     },
     options: {
@@ -304,16 +302,16 @@
         return;
       }
 
-      // signature theo 60 điểm cuối (đủ nhạy cho realtime seconds)
-      const sig = JSON.stringify(series.slice(-60).map(p=>[p.k, p.v]));
+      // signature theo 80 điểm cuối
+      const sig = JSON.stringify(series.slice(-80).map(p=>[p.k, p.v]));
       if (!force && sig === lastSig && mode !== "now") return;
       lastSig = sig;
 
       if (mode === "now"){
         // ✅ 60 GIÂY gần nhất
-        const win = buildCurrentSecondWindow(new Date());
+        const win = buildSecondWindow(new Date());
 
-        // map bucket -> last value
+        // map bucket(second) -> last value
         const lastByBucket = new Map();
         for (const p of series){
           const bk = bucketKey("second", p.t);
@@ -322,9 +320,15 @@
         }
 
         const labels = win.map(x => x.lb);
-        const values = win.map(x => lastByBucket.get(x.bk)?.v ?? null);
 
-        // cần >=2 điểm có data thật
+        // ✅ forward-fill: thiếu data giây nào thì lấy giá trị gần nhất trước đó
+        let last = null;
+        const values = win.map(x => {
+          const v = lastByBucket.get(x.bk)?.v ?? null;
+          if (v !== null) last = v;
+          return last; // nếu chưa có last thì vẫn null
+        });
+
         const nonNullCount = values.filter(v => v !== null).length;
         if (nonNullCount < 2){
           showNoData(true);
