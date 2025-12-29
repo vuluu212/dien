@@ -104,6 +104,8 @@
   document.getElementById("hint").textContent = SENSOR_ID;
 
   const ROOT = "DataGarden/Sensor";
+  const LIMIT_POINTS = 60; // ✅ luôn hiển thị 60 mốc (nếu có)
+
   const noDataEl = document.getElementById("noData");
   const canvasEl = document.getElementById("chart");
 
@@ -112,14 +114,10 @@
     canvasEl.style.display = show ? "none" : "block";
   }
 
-  // ========= CONFIG: số điểm muốn hiển thị =========
-  const LIMIT_POINTS = 60; // ✅ bạn muốn 60 điểm thay vì 7
-
   // ========= time helpers =========
   const pad2 = n => String(n).padStart(2,"0");
 
   function parseKeyToDate(key){
-    // yyyy-MM-dd-hh-mm-ss
     const parts = key.split("-").map(x => parseInt(x,10));
     if (parts.length !== 6 || parts.some(Number.isNaN)) return null;
     const [y, mo, d, h, mi, s] = parts;
@@ -142,7 +140,6 @@
     return { week, weekYear: dt.getUTCFullYear() };
   }
 
-  // Bucket key theo mode (để gom)
   function bucketKey(mode, dt){
     const y = dt.getFullYear();
     const m = pad2(dt.getMonth()+1);
@@ -150,15 +147,14 @@
     const h = pad2(dt.getHours());
     const mi= pad2(dt.getMinutes());
 
-    if (mode === "minute") return `${y}-${m}-${d}-${h}-${mi}`; // YYYY-MM-DD-hh-mm
-    if (mode === "hour")   return `${y}-${m}-${d}-${h}`;       // YYYY-MM-DD-hh
-    if (mode === "day")    return `${y}-${m}-${d}`;            // YYYY-MM-DD
-    if (mode === "month")  return `${y}-${m}`;                 // YYYY-MM
+    if (mode === "minute") return `${y}-${m}-${d}-${h}-${mi}`;
+    if (mode === "hour")   return `${y}-${m}-${d}-${h}`;
+    if (mode === "day")    return `${y}-${m}-${d}`;
+    if (mode === "month")  return `${y}-${m}`;
     const { week, weekYear } = isoWeek(dt);
-    return `${weekYear}-W${pad2(week)}`;                       // YYYY-Wxx
+    return `${weekYear}-W${pad2(week)}`;
   }
 
-  // Label theo mode (rút năm 2025->25)
   function labelForMode(mode, dt){
     const y2 = String(dt.getFullYear()).slice(-2);
     const m  = pad2(dt.getMonth()+1);
@@ -193,7 +189,7 @@
     return pts;
   }
 
-  // ========= Aggregate: lấy giá trị CUỐI bucket =========
+  // lấy giá trị CUỐI bucket
   function aggregate(points, mode){
     const map = new Map(); // bucket -> { lastT, v }
     for (const p of points){
@@ -206,14 +202,6 @@
     return Array.from(map.entries())
       .sort((a,b)=>a[0].localeCompare(b[0]))
       .map(([_,it]) => ({ t: it.lastT, v: it.v }));
-  }
-
-  // ========= “Khung thời gian” cố định (không nhảy theo data mới) =========
-  // Khi bạn chọn mode, hệ thống chụp endTime = now, và chỉ hiển thị các điểm <= endTime
-  let endTime = new Date();
-
-  function freezeWindow() {
-    endTime = new Date(); // chụp thời điểm hiện tại
   }
 
   // ========= Chart =========
@@ -231,7 +219,7 @@
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      animation: false, // mượt
+      animation: false,       // ✅ mượt, không giật
       plugins: {
         title: { display: false },
         legend: { display: true }
@@ -245,17 +233,14 @@
   let appliedSig = "";
   function applyData(labels, values){
     const sig = JSON.stringify([labels, values]);
-    if (sig === appliedSig) return;
+    if (sig === appliedSig) return;   // ✅ không đổi thì khỏi update
     appliedSig = sig;
 
     chart.data.labels = labels;
     chart.data.datasets[0].data = values;
-    chart.update("none");
+    chart.update("none");             // ✅ update nhẹ
   }
-
-  function clearChart(){
-    applyData([], []);
-  }
+  function clearChart(){ applyData([], []); }
 
   // ========= Mode buttons =========
   const btns = {
@@ -267,22 +252,12 @@
   };
 
   let mode = "minute";
-
   function setActive(){
     Object.entries(btns).forEach(([k,el]) => el.classList.toggle("active", k===mode));
   }
-
   Object.keys(btns).forEach(k => {
-    btns[k].onclick = () => {
-      mode = k;
-      freezeWindow();      // ✅ chụp khung thời gian khi đổi mode
-      lastSig = "";
-      tick(true);
-      setActive();
-    };
+    btns[k].onclick = () => { mode = k; lastSig=""; tick(true); setActive(); };
   });
-
-  freezeWindow();
   setActive();
 
   // ========= Auto refresh 2s =========
@@ -292,40 +267,33 @@
     try{
       const series = await loadSensorSeries();
 
-      // ✅ chỉ hiển thị dữ liệu <= endTime (khung thời gian cố định)
-      const filtered = series.filter(p => p.t <= endTime);
-
-      // ✅ lấy chữ ký theo 20 điểm cuối để phát hiện có đổi không
-      const sig = JSON.stringify(filtered.slice(-20).map(p=>[p.k, p.v]));
-      if (!force && sig === lastSig) return;
-      lastSig = sig;
-
-      // cần ít nhất 2 điểm gốc
-      if (filtered.length < 2){
+      // điều kiện có >=2 giao dịch
+      if (series.length < 2){
         showNoData(true);
         clearChart();
         return;
       }
 
-      const agg = aggregate(filtered, mode);
+      // signature theo 30 điểm cuối (đủ nhạy mà nhẹ)
+      const sig = JSON.stringify(series.slice(-30).map(p=>[p.k, p.v]));
+      if (!force && sig === lastSig) return;
+      lastSig = sig;
 
-      // ✅ chỉ lấy 60 điểm gần nhất để hiển thị nhiều hơn
-      const sliced = agg.slice(-LIMIT_POINTS);
+      const agg = aggregate(series, mode);
+      const sliced = agg.slice(-LIMIT_POINTS); // ✅ luôn lấy 60 mốc gần nhất
 
-      const labels = sliced.map(p => labelForMode(mode, p.t));
-      const values = sliced.map(p => p.v);
-
-      // sau gom vẫn phải >= 2 điểm
-      if (labels.length < 2){
+      if (sliced.length < 2){
         showNoData(true);
         clearChart();
         return;
       }
 
       showNoData(false);
-      applyData(labels, values);
-
-    }catch(e){
+      applyData(
+        sliced.map(p => labelForMode(mode, p.t)),
+        sliced.map(p => p.v)
+      );
+    } catch(e){
       console.error(e);
     }
   }
