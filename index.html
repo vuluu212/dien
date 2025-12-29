@@ -66,6 +66,7 @@
     <button class="btn" id="btnDay">Ngày</button>
     <button class="btn" id="btnHour">Giờ</button>
     <button class="btn" id="btnMinute">Phút</button>
+    <button class="btn" id="btnNow">Hiện tại</button>
     <div class="hint" id="hint"></div>
   </div>
 
@@ -104,7 +105,10 @@
   document.getElementById("hint").textContent = SENSOR_ID;
 
   const ROOT = "DataGarden/Sensor";
-  const LIMIT_POINTS = 60; // ✅ luôn hiển thị 60 mốc (nếu có)
+  const LIMIT_POINTS = 60; // ✅ 60 khung gần nhất
+
+  // “Hiện tại” sẽ dùng mode này để tạo khung 60 điểm gần nhất
+  const CURRENT_MODE = "minute"; // minute = 60 phút gần nhất (mỗi phút 1 điểm)
 
   const noDataEl = document.getElementById("noData");
   const canvasEl = document.getElementById("chart");
@@ -151,6 +155,7 @@
     if (mode === "hour")   return `${y}-${m}-${d}-${h}`;
     if (mode === "day")    return `${y}-${m}-${d}`;
     if (mode === "month")  return `${y}-${m}`;
+    // week
     const { week, weekYear } = isoWeek(dt);
     return `${weekYear}-W${pad2(week)}`;
   }
@@ -191,7 +196,7 @@
 
   // lấy giá trị CUỐI bucket
   function aggregate(points, mode){
-    const map = new Map(); // bucket -> { lastT, v }
+    const map = new Map();
     for (const p of points){
       const bk = bucketKey(mode, p.t);
       const cur = map.get(bk);
@@ -202,6 +207,21 @@
     return Array.from(map.entries())
       .sort((a,b)=>a[0].localeCompare(b[0]))
       .map(([_,it]) => ({ t: it.lastT, v: it.v }));
+  }
+
+  // tạo 60 bucket “khung hiện tại” theo CURRENT_MODE (minute)
+  function buildCurrentWindowBuckets(now = new Date()){
+    const buckets = [];
+    // làm tròn xuống phút (00 giây) để label ổn định
+    const end = new Date(now);
+    end.setSeconds(0, 0);
+
+    for (let i = LIMIT_POINTS - 1; i >= 0; i--){
+      const t = new Date(end);
+      if (CURRENT_MODE === "minute") t.setMinutes(end.getMinutes() - i);
+      buckets.push({ t, bk: bucketKey("minute", t), lb: labelForMode("minute", t) });
+    }
+    return buckets;
   }
 
   // ========= Chart =========
@@ -219,7 +239,7 @@
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      animation: false,       // ✅ mượt, không giật
+      animation: false,
       plugins: {
         title: { display: false },
         legend: { display: true }
@@ -233,12 +253,12 @@
   let appliedSig = "";
   function applyData(labels, values){
     const sig = JSON.stringify([labels, values]);
-    if (sig === appliedSig) return;   // ✅ không đổi thì khỏi update
+    if (sig === appliedSig) return;
     appliedSig = sig;
 
     chart.data.labels = labels;
     chart.data.datasets[0].data = values;
-    chart.update("none");             // ✅ update nhẹ
+    chart.update("none");
   }
   function clearChart(){ applyData([], []); }
 
@@ -249,38 +269,68 @@
     day: document.getElementById("btnDay"),
     hour: document.getElementById("btnHour"),
     minute: document.getElementById("btnMinute"),
+    now: document.getElementById("btnNow"),
   };
 
   let mode = "minute";
   function setActive(){
     Object.entries(btns).forEach(([k,el]) => el.classList.toggle("active", k===mode));
   }
+
   Object.keys(btns).forEach(k => {
     btns[k].onclick = () => { mode = k; lastSig=""; tick(true); setActive(); };
   });
   setActive();
 
-  // ========= Auto refresh 2s =========
+  // ========= Auto refresh =========
   let lastSig = "";
 
   async function tick(force=false){
     try{
       const series = await loadSensorSeries();
-
-      // điều kiện có >=2 giao dịch
       if (series.length < 2){
         showNoData(true);
         clearChart();
         return;
       }
 
-      // signature theo 30 điểm cuối (đủ nhạy mà nhẹ)
+      // signature theo 30 điểm cuối
       const sig = JSON.stringify(series.slice(-30).map(p=>[p.k, p.v]));
-      if (!force && sig === lastSig) return;
+      if (!force && sig === lastSig && mode !== "now") return;
       lastSig = sig;
 
+      if (mode === "now"){
+        // ✅ 60 phút gần nhất (khung cố định theo thời gian thực)
+        const win = buildCurrentWindowBuckets(new Date());
+
+        // map bucket -> last value
+        const lastByBucket = new Map();
+        for (const p of series){
+          const bk = bucketKey("minute", p.t);
+          // lấy last value theo bucket
+          const cur = lastByBucket.get(bk);
+          if (!cur || p.t > cur.t) lastByBucket.set(bk, { t: p.t, v: p.v });
+        }
+
+        const labels = win.map(x => x.lb);
+        const values = win.map(x => lastByBucket.get(x.bk)?.v ?? null);
+
+        // cần >=2 điểm có dữ liệu thật (không null) để hiển thị
+        const nonNullCount = values.filter(v => v !== null).length;
+        if (nonNullCount < 2){
+          showNoData(true);
+          clearChart();
+          return;
+        }
+
+        showNoData(false);
+        applyData(labels, values);
+        return;
+      }
+
+      // các mode bình thường
       const agg = aggregate(series, mode);
-      const sliced = agg.slice(-LIMIT_POINTS); // ✅ luôn lấy 60 mốc gần nhất
+      const sliced = agg.slice(-LIMIT_POINTS);
 
       if (sliced.length < 2){
         showNoData(true);
