@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DataGarden Sensors Chart</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .wrap { height: 100%; display: flex; flex-direction: column; }
+
+    .bar{
+      padding: 10px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    .btn{
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: 1px solid #d1d5db;
+      background: #fff;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn.active{
+      border-color:#111827;
+      background:#111827;
+      color:#fff;
+    }
+
+    .canvas-wrap{
+      flex: 1;
+      padding: 10px;
+      box-sizing: border-box;
+      position: relative;
+    }
+    canvas{ width:100% !important; height:100% !important; }
+
+    .no-data{
+      position:absolute;
+      inset:0;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      background:#fff;
+    }
+    .no-data img{ max-width: 55%; opacity: 0.9; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="bar">
+    <button class="btn" id="btnMonth">Tháng</button>
+    <button class="btn" id="btnWeek">Tuần</button>
+    <button class="btn" id="btnDay">Ngày</button>
+    <button class="btn" id="btnHour">Giờ</button>
+    <button class="btn" id="btnMinute">Phút</button>
+    <button class="btn" id="btnNow">Hiện tại</button>
+  </div>
+
+  <div class="canvas-wrap">
+    <canvas id="chart"></canvas>
+    <div class="no-data" id="noData">
+      <img src="no_data.png" alt="No data">
+    </div>
+  </div>
+</div>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js";
+  import { getDatabase, ref, get } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-database.js";
+
+  // ✅ SỬA CHO ĐÚNG PROJECT CỦA BẠN
+  const firebaseConfig = {
+    apiKey: "YOUR_API_KEY",
+    authDomain: "YOUR_PROJECT.firebaseapp.com",
+    databaseURL: "https://iot-mg-default-rtdb.firebaseio.com",
+    projectId: "YOUR_PROJECT_ID",
+    appId: "YOUR_APP_ID",
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getDatabase(app);
+
+  // ====== Danh sách 6 cảm biến (đúng theo ảnh) ======
+  // Lưu ý: đổi tên key cho khớp y hệt node trong Firebase của bạn
+  const SENSORS = [
+    { key: "Humidity_sensor",     label: "Humidity" },
+    { key: "Light_sensor",        label: "Light" },
+    { key: "Pressure_sensor",     label: "Pressure" },
+    { key: "Rain_sensor",         label: "Rain" },
+    { key: "Temperature_sensor",  label: "Temperature" },
+    { key: "Humidity_gr_sensor",  label: "Soil Humidity" },
+  ];
+
+  const ROOT = "DataGarden/Sensor";
+
+  // ====== UI ======
+  const noDataEl = document.getElementById("noData");
+  const canvasEl = document.getElementById("chart");
+
+  function showNoData(show){
+    noDataEl.style.display = show ? "flex" : "none";
+    canvasEl.style.display = show ? "none" : "block";
+  }
+
+  // ====== Parse time key: yyyy-MM-dd-hh-mm-ss ======
+  function parseKeyToDate(key){
+    const parts = key.split("-").map(n => parseInt(n, 10));
+    if (parts.length !== 6 || parts.some(Number.isNaN)) return null;
+    const [y, mo, d, h, mi, s] = parts;
+    return new Date(y, mo - 1, d, h, mi, s);
+  }
+
+  function toNumber(val){
+    if (val === null || val === undefined) return null;
+    const s = String(val).replace(/"/g, "").trim();
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  const pad2 = (n)=>String(n).padStart(2,"0");
+
+  // ISO week
+  function isoWeek(date) {
+    const dt = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+    const dayNum = dt.getUTCDay() || 7;
+    dt.setUTCDate(dt.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(dt.getUTCFullYear(), 0, 1));
+    const week = Math.ceil((((dt - yearStart) / 86400000) + 1) / 7);
+    return { week, weekYear: dt.getUTCFullYear() };
+  }
+
+  // Bucket key theo mode
+  function bucketKey(mode, dt){
+    const y = dt.getFullYear();
+    const m = pad2(dt.getMonth()+1);
+    const d = pad2(dt.getDate());
+    const h = pad2(dt.getHours());
+    const mi= pad2(dt.getMinutes());
+
+    if (mode === "minute") return `${y}-${m}-${d}-${h}-${mi}`; // YYYY-MM-DD-hh-mm
+    if (mode === "hour")   return `${y}-${m}-${d}-${h}`;       // YYYY-MM-DD-hh
+    if (mode === "day")    return `${y}-${m}-${d}`;            // YYYY-MM-DD
+    if (mode === "month")  return `${y}-${m}`;                 // YYYY-MM
+    // week
+    const { week, weekYear } = isoWeek(dt);
+    return `${weekYear}-W${pad2(week)}`;                       // YYYY-Wxx
+  }
+
+  // Label theo mode (rút năm 2025 -> 25)
+  function labelForMode(mode, dt){
+    const y2 = String(dt.getFullYear()).slice(-2);
+    const m  = pad2(dt.getMonth()+1);
+    const d  = pad2(dt.getDate());
+    const h  = pad2(dt.getHours());
+    const mi = pad2(dt.getMinutes());
+
+    if (mode === "minute") return `${d}/${m} ${h}:${mi}`;   // dd/MM hh:mm
+    if (mode === "hour")   return `${d}/${m} ${h}h`;        // dd/MM hh
+    if (mode === "day")    return `${d}/${m}`;              // dd/MM
+    if (mode === "month")  return `${m}/${y2}`;             // MM/YY
+    const { week, weekYear } = isoWeek(dt);
+    const wy2 = String(weekYear).slice(-2);
+    return `W${pad2(week)}/${wy2}`;                         // Wxx/YY
+  }
+
+  // ====== Load series cho 1 sensor ======
+  // ưu tiên: DataGarden/Sensor/<key>/Date
+  async function loadSensorSeries(sensorKey){
+    const datePath = `${ROOT}/${sensorKey}/Date`;
+    const snap = await get(ref(db, datePath));
+    if (!snap.exists()) return null;
+
+    const obj = snap.val(); // { "yyyy-..-ss": value, ... }
+    const points = Object.entries(obj).map(([k,v]) => {
+      const dt = parseKeyToDate(k);
+      const val = toNumber(v);
+      if (!dt || val === null) return null;
+      return { t: dt, v: val };
+    }).filter(Boolean);
+
+    points.sort((a,b)=>a.t-b.t);
+    return points;
+  }
+
+  // ====== Load current cho 1 sensor ======
+  // ưu tiên: DataGarden/Sensor/<key> (nếu là number)
+  // nếu là object, thử tìm field trùng tên hoặc lấy last của Date series
+  async function loadSensorCurrent(sensorKey){
+    const snap = await get(ref(db, `${ROOT}/${sensorKey}`));
+    if (snap.exists()){
+      const val = snap.val();
+      if (typeof val === "number" || typeof val === "string"){
+        const n = toNumber(val);
+        if (n !== null) return n;
+      }
+      // nếu object có field trùng sensorKey (hiếm) hoặc 1 field duy nhất
+      if (typeof val === "object" && val !== null){
+        if (val[sensorKey] !== undefined){
+          const n = toNumber(val[sensorKey]);
+          if (n !== null) return n;
+        }
+      }
+    }
+
+    // fallback: lấy điểm cuối từ Date
+    const series = await loadSensorSeries(sensorKey);
+    if (series && series.length) return series[series.length-1].v;
+    return null;
+  }
+
+  // ====== Aggregate theo mode cho 1 series ======
+  // cách gom: lấy giá trị cuối cùng trong bucket (dễ đọc khi sensor update liên tục)
+  function aggregateSeries(points, mode){
+    const map = new Map(); // bucket -> { lastT, v }
+    for (const p of points){
+      const bk = bucketKey(mode, p.t);
+      const cur = map.get(bk);
+      if (!cur || p.t > cur.lastT){
+        map.set(bk, { lastT: p.t, v: p.v });
+      }
+    }
+    const arr = Array.from(map.entries())
+      .sort((a,b)=>a[0].localeCompare(b[0]))
+      .map(([_, it]) => ({ t: it.lastT, v: it.v }));
+    return arr;
+  }
+
+  // ====== Chart ======
+  const chart = new Chart(canvasEl, {
+    type: "line",
+    data: { labels: [], datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        title: { display: false },
+        legend: { display: true }
+      },
+      scales: {
+        y: { ticks: { callback: (v)=>Number(v).toLocaleString("vi-VN") } }
+      }
+    }
+  });
+
+  function setDatasets(){
+    chart.data.datasets = SENSORS.map(s => ({
+      label: s.label,
+      data: [],
+      tension: 0.25,
+      pointRadius: 2
+    }));
+  }
+  setDatasets();
+
+  // ====== Mode buttons ======
+  const btns = {
+    month: document.getElementById("btnMonth"),
+    week: document.getElementById("btnWeek"),
+    day: document.getElementById("btnDay"),
+    hour: document.getElementById("btnHour"),
+    minute: document.getElementById("btnMinute"),
+    now: document.getElementById("btnNow"),
+  };
+
+  let mode = "minute"; // default chi tiết
+  function setActive(){
+    Object.entries(btns).forEach(([k,el]) => el.classList.toggle("active", k===mode));
+  }
+
+  Object.keys(btns).forEach(k => {
+    btns[k].onclick = () => { mode = k; lastSig=""; tick(true); setActive(); };
+  });
+  setActive();
+
+  // ====== Render ======
+  function clearChart(){
+    chart.data.labels = [];
+    chart.data.datasets.forEach(ds => ds.data = []);
+    chart.update();
+  }
+
+  // Quy tắc hiển thị:
+  // - mode != now: phải có >=2 điểm X (labels) thì mới vẽ
+  // - mode == now: nếu có ít nhất 1 sensor có data thì vẽ (1 điểm)
+  function renderMultiSeries(labelList, seriesBySensor){
+    // labels chung cho tất cả sensors (để so sánh)
+    chart.data.labels = labelList;
+
+    // map label -> index
+    const idx = new Map(labelList.map((lb,i)=>[lb,i]));
+
+    // reset
+    chart.data.datasets.forEach(ds => ds.data = new Array(labelList.length).fill(null));
+
+    // fill theo từng sensor
+    seriesBySensor.forEach((pts, si) => {
+      for (const p of pts){
+        const lb = labelForMode(mode, p.t);
+        const i = idx.get(lb);
+        if (i !== undefined) chart.data.datasets[si].data[i] = p.v;
+      }
+    });
+
+    chart.update();
+  }
+
+  // ====== Auto refresh ======
+  let lastSig = "";
+
+  async function tick(force=false){
+    try{
+      if (mode === "now"){
+        // 1 điểm “now” cho mỗi sensor
+        const now = new Date();
+        const nowLabel = "Now";
+        const values = await Promise.all(SENSORS.map(s => loadSensorCurrent(s.key)));
+
+        const hasAny = values.some(v => v !== null);
+        if (!hasAny){
+          showNoData(true);
+          clearChart();
+          return;
+        }
+
+        showNoData(false);
+        chart.data.labels = [nowLabel];
+        chart.data.datasets.forEach((ds,i)=> ds.data = [values[i] ?? null]);
+        chart.update();
+        return;
+      }
+
+      // load series cho 6 sensors
+      const seriesList = await Promise.all(SENSORS.map(s => loadSensorSeries(s.key)));
+
+      // chỉ giữ sensor nào có series
+      // vẫn giữ đủ 6 line (sensor thiếu data sẽ là null)
+      const nonNullSeries = seriesList.map(s => s || []);
+
+      // signature để tránh update thừa
+      const sig = JSON.stringify(nonNullSeries.map(arr => arr.slice(-5).map(p=>[p.t?.toISOString?.() ?? "", p.v])));
+      if (!force && sig === lastSig) return;
+      lastSig = sig;
+
+      // aggregate theo mode
+      const agg = nonNullSeries.map(arr => aggregateSeries(arr, mode));
+
+      // tạo labels union (theo thời gian) từ tất cả sensors
+      const labelSet = new Map(); // label -> Date (để sort theo Date)
+      for (const pts of agg){
+        for (const p of pts){
+          const lb = labelForMode(mode, p.t);
+          // giữ Date sớm nhất cho label (để sort ổn định)
+          if (!labelSet.has(lb)) labelSet.set(lb, p.t);
+        }
+      }
+      const labels = Array.from(labelSet.entries())
+        .sort((a,b)=>a[1]-b[1])
+        .map(([lb])=>lb);
+
+      // ✅ điều kiện: phải có >=2 mốc thời gian
+      if (labels.length < 2){
+        showNoData(true);
+        clearChart();
+        return;
+      }
+
+      showNoData(false);
+      setDatasets(); // đảm bảo luôn có 6 line
+      renderMultiSeries(labels, agg);
+
+    }catch(e){
+      console.error(e);
+    }
+  }
+
+  tick(true);
+  setInterval(()=>tick(false), 2000);
+</script>
+</body>
+</html>
