@@ -33,7 +33,7 @@
     }
     .hint{
       margin-left: auto;
-      font-weight: 700;
+      font-weight: 800;
       color: #111827;
       white-space: nowrap;
     }
@@ -66,7 +66,6 @@
     <button class="btn" id="btnDay">Ngày</button>
     <button class="btn" id="btnHour">Giờ</button>
     <button class="btn" id="btnMinute">Phút</button>
-    <button class="btn" id="btnNow">Hiện tại</button>
     <div class="hint" id="hint"></div>
   </div>
 
@@ -96,15 +95,12 @@
 
   // ========= URL: ?id=<sensorKey> =========
   const params = new URLSearchParams(location.search);
-  const SENSOR_ID = (params.get("id") || "").trim();  // ví dụ Humidity_gr_sensor
-
+  const SENSOR_ID = (params.get("id") || "").trim();
   if (!SENSOR_ID) {
     document.body.innerHTML =
       "<div style='padding:14px;font-family:system-ui'>Thiếu sensor id. Ví dụ: <b>?id=Humidity_gr_sensor</b></div>";
     throw new Error("Missing sensor id");
   }
-
-  // Hiển thị tên sensor trên thanh
   document.getElementById("hint").textContent = SENSOR_ID;
 
   const ROOT = "DataGarden/Sensor";
@@ -115,6 +111,9 @@
     noDataEl.style.display = show ? "flex" : "none";
     canvasEl.style.display = show ? "none" : "block";
   }
+
+  // ========= CONFIG: số điểm muốn hiển thị =========
+  const LIMIT_POINTS = 60; // ✅ bạn muốn 60 điểm thay vì 7
 
   // ========= time helpers =========
   const pad2 = n => String(n).padStart(2,"0");
@@ -143,6 +142,7 @@
     return { week, weekYear: dt.getUTCFullYear() };
   }
 
+  // Bucket key theo mode (để gom)
   function bucketKey(mode, dt){
     const y = dt.getFullYear();
     const m = pad2(dt.getMonth()+1);
@@ -158,6 +158,7 @@
     return `${weekYear}-W${pad2(week)}`;                       // YYYY-Wxx
   }
 
+  // Label theo mode (rút năm 2025->25)
   function labelForMode(mode, dt){
     const y2 = String(dt.getFullYear()).slice(-2);
     const m  = pad2(dt.getMonth()+1);
@@ -165,16 +166,16 @@
     const h  = pad2(dt.getHours());
     const mi = pad2(dt.getMinutes());
 
-    if (mode === "minute") return `${d}/${m} ${h}:${mi}`;   // dd/MM hh:mm
-    if (mode === "hour")   return `${d}/${m} ${h}h`;        // dd/MM hh
-    if (mode === "day")    return `${d}/${m}`;              // dd/MM
-    if (mode === "month")  return `${m}/${y2}`;             // MM/YY
+    if (mode === "minute") return `${d}/${m} ${h}:${mi}`;
+    if (mode === "hour")   return `${d}/${m} ${h}h`;
+    if (mode === "day")    return `${d}/${m}`;
+    if (mode === "month")  return `${m}/${y2}`;
     const { week, weekYear } = isoWeek(dt);
     const wy2 = String(weekYear).slice(-2);
-    return `W${pad2(week)}/${wy2}`;                         // Wxx/YY
+    return `W${pad2(week)}/${wy2}`;
   }
 
-  // ========= load series =========
+  // ========= Load series =========
   async function loadSensorSeries(){
     const datePath = `${ROOT}/${SENSOR_ID}/Date`;
     const snap = await get(ref(db, datePath));
@@ -185,35 +186,14 @@
       const dt = parseKeyToDate(k);
       const val= toNumber(v);
       if (!dt || val === null) return null;
-      return { t: dt, v: val };
+      return { t: dt, v: val, k };
     }).filter(Boolean);
 
     pts.sort((a,b)=>a.t-b.t);
     return pts;
   }
 
-  async function loadCurrentValue(){
-    // ưu tiên nếu node SENSOR_ID có value trực tiếp (không phải object)
-    const snap = await get(ref(db, `${ROOT}/${SENSOR_ID}`));
-    if (snap.exists()){
-      const v = snap.val();
-      if (typeof v === "number" || typeof v === "string"){
-        const n = toNumber(v);
-        if (n !== null) return n;
-      }
-      if (typeof v === "object" && v !== null && v[SENSOR_ID] !== undefined){
-        const n = toNumber(v[SENSOR_ID]);
-        if (n !== null) return n;
-      }
-    }
-    // fallback: điểm cuối Date
-    const series = await loadSensorSeries();
-    if (series.length) return series[series.length-1].v;
-    return null;
-  }
-
-  // ========= aggregate =========
-  // lấy giá trị CUỐI bucket (mượt và đúng khi dữ liệu dày)
+  // ========= Aggregate: lấy giá trị CUỐI bucket =========
   function aggregate(points, mode){
     const map = new Map(); // bucket -> { lastT, v }
     for (const p of points){
@@ -223,13 +203,20 @@
         map.set(bk, { lastT: p.t, v: p.v });
       }
     }
-    // sort theo bucket key (an toàn)
     return Array.from(map.entries())
       .sort((a,b)=>a[0].localeCompare(b[0]))
       .map(([_,it]) => ({ t: it.lastT, v: it.v }));
   }
 
-  // ========= chart =========
+  // ========= “Khung thời gian” cố định (không nhảy theo data mới) =========
+  // Khi bạn chọn mode, hệ thống chụp endTime = now, và chỉ hiển thị các điểm <= endTime
+  let endTime = new Date();
+
+  function freezeWindow() {
+    endTime = new Date(); // chụp thời điểm hiện tại
+  }
+
+  // ========= Chart =========
   const chart = new Chart(canvasEl, {
     type: "line",
     data: {
@@ -238,16 +225,16 @@
         label: SENSOR_ID,
         data: [],
         tension: 0.25,
-        pointRadius: 2,
+        pointRadius: 2
       }]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      animation: false, // ✅ tránh “giật” khi update
+      animation: false, // mượt
       plugins: {
         title: { display: false },
-        legend: { display: true },
+        legend: { display: true }
       },
       scales: {
         y: { ticks: { callback: (v)=>Number(v).toLocaleString("vi-VN") } }
@@ -255,37 +242,14 @@
     }
   });
 
-  // ========= mode buttons =========
-  const btns = {
-    month: document.getElementById("btnMonth"),
-    week: document.getElementById("btnWeek"),
-    day: document.getElementById("btnDay"),
-    hour: document.getElementById("btnHour"),
-    minute: document.getElementById("btnMinute"),
-    now: document.getElementById("btnNow"),
-  };
-
-  let mode = "minute"; // default chi tiết
-  function setActive(){
-    Object.entries(btns).forEach(([k,el]) => el.classList.toggle("active", k===mode));
-  }
-
-  Object.keys(btns).forEach(k => {
-    btns[k].onclick = () => { mode = k; lastSig = ""; tick(true); setActive(); };
-  });
-  setActive();
-
-  // ========= smooth update (không reload toàn chart) =========
+  let appliedSig = "";
   function applyData(labels, values){
-    // Nếu giống y hệt thì không update
     const sig = JSON.stringify([labels, values]);
     if (sig === appliedSig) return;
     appliedSig = sig;
 
     chart.data.labels = labels;
     chart.data.datasets[0].data = values;
-
-    // ✅ update nhẹ, không reset animation
     chart.update("none");
   }
 
@@ -293,42 +257,65 @@
     applyData([], []);
   }
 
+  // ========= Mode buttons =========
+  const btns = {
+    month: document.getElementById("btnMonth"),
+    week: document.getElementById("btnWeek"),
+    day: document.getElementById("btnDay"),
+    hour: document.getElementById("btnHour"),
+    minute: document.getElementById("btnMinute"),
+  };
+
+  let mode = "minute";
+
+  function setActive(){
+    Object.entries(btns).forEach(([k,el]) => el.classList.toggle("active", k===mode));
+  }
+
+  Object.keys(btns).forEach(k => {
+    btns[k].onclick = () => {
+      mode = k;
+      freezeWindow();      // ✅ chụp khung thời gian khi đổi mode
+      lastSig = "";
+      tick(true);
+      setActive();
+    };
+  });
+
+  freezeWindow();
+  setActive();
+
+  // ========= Auto refresh 2s =========
   let lastSig = "";
-  let appliedSig = "";
 
   async function tick(force=false){
     try{
-      if (mode === "now"){
-        const v = await loadCurrentValue();
-        if (v === null){
-          showNoData(true);
-          clearChart();
-          return;
-        }
-        showNoData(false);
-        applyData(["Now"], [v]);
-        return;
-      }
-
       const series = await loadSensorSeries();
 
-      // Điều kiện: phải có >=2 điểm gốc
-      if (series.length < 2){
+      // ✅ chỉ hiển thị dữ liệu <= endTime (khung thời gian cố định)
+      const filtered = series.filter(p => p.t <= endTime);
+
+      // ✅ lấy chữ ký theo 20 điểm cuối để phát hiện có đổi không
+      const sig = JSON.stringify(filtered.slice(-20).map(p=>[p.k, p.v]));
+      if (!force && sig === lastSig) return;
+      lastSig = sig;
+
+      // cần ít nhất 2 điểm gốc
+      if (filtered.length < 2){
         showNoData(true);
         clearChart();
         return;
       }
 
-      // chỉ update khi data thay đổi (lấy 10 điểm cuối để signature nhanh)
-      const sig = JSON.stringify(series.slice(-10).map(p=>[p.t.toISOString(), p.v]));
-      if (!force && sig === lastSig) return;
-      lastSig = sig;
+      const agg = aggregate(filtered, mode);
 
-      const agg = aggregate(series, mode);
-      const labels = agg.map(p => labelForMode(mode, p.t));
-      const values = agg.map(p => p.v);
+      // ✅ chỉ lấy 60 điểm gần nhất để hiển thị nhiều hơn
+      const sliced = agg.slice(-LIMIT_POINTS);
 
-      // Điều kiện: sau gom vẫn phải có >=2 mốc thời gian
+      const labels = sliced.map(p => labelForMode(mode, p.t));
+      const values = sliced.map(p => p.v);
+
+      // sau gom vẫn phải >= 2 điểm
       if (labels.length < 2){
         showNoData(true);
         clearChart();
